@@ -26,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -353,7 +354,7 @@ func (rf *Raft) startElection() {
 				DPrintf("[%d]:Term %v, get voted from peer %v, candidate %v", rf.me, rf.currentTerm, i, args.CandidateID)
 				*votes++
 				if *votes >= len(rf.peers)/2 && rf.currentTerm == args.Term && rf.state == CANDIDATE {
-					DPrintf("[%d]:Term %v selected as leader, candidate %v", rf.currentTerm, rf.me, rf.me)
+					DPrintf("[%d]:Term %v selected as leader, candidate %v", rf.me, rf.currentTerm, rf.me)
 					rf.state = LEADER
 
 					for i, _ := range rf.peers {
@@ -383,7 +384,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if args.Term > rf.currentTerm {
 		rf.setNewTerm(args.Term)
-		rf.currentTerm = rf.currentTerm
+		reply.Term = rf.currentTerm
 		return
 	}
 
@@ -425,6 +426,86 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) startAppendEntries(heartBeat bool) {
+	if heartBeat {
+		DPrintf("[%v]: heartbeat", rf.me)
+	} else {
+		DPrintf("[%v]:term %v leader %v start appendEntries", rf.me, rf.currentTerm, rf.me)
+	}
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(i int) {
+			rf.mu.Lock()
+			next := rf.nextIndex[i]
+			var args AppendEntriesArgs
+			if next <= 0 {
+				next = 1
+			}
+			args = AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.log[next-1].Index,
+				PrevLogTerm:  rf.log[next-1].Term,
+				Entries:      rf.log[next:],
+				LeaderCommit: rf.lastApplied,
+			}
+			rf.mu.Unlock()
+
+			reply := AppendEntriesReply{}
+			DPrintf("||| [%v]: appendEntries %v to %v, next is %v, nextIndex %v |||", rf.me, args, i, next, rf.nextIndex)
+
+			ok := rf.sendAppendEntries(i, &args, &reply)
+			if !ok {
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if rf.state != LEADER || rf.currentTerm > reply.Term || rf.currentTerm != args.Term {
+				return
+			}
+
+			if reply.Term > rf.currentTerm {
+				rf.setNewTerm(reply.Term)
+				return
+			}
+
+			if reply.Success {
+				match := args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[i] = max(match+1, rf.nextIndex[i])
+				rf.matchIndex[i] = max(match, rf.matchIndex[i])
+				DPrintf("[%v]: %v append success next %v, match %v, rf.matchIndex %v, rf.nextIndex %v", rf.me, i, rf.nextIndex[i], rf.matchIndex[i], rf.matchIndex, rf.nextIndex)
+				for n := rf.commitIndex + 1; n <= rf.log[len(rf.log)-1].Index; n++ {
+					DPrintf("###[%v]: term %v, rf.matchIndex %v, counting for index %v  ####", rf.me, rf.currentTerm, rf.matchIndex, n)
+
+					if rf.log[n].Term != rf.currentTerm {
+						DPrintf("[%v]:### Term not match, %v, %v ####", rf.me, rf.log[n].Term, rf.currentTerm)
+						continue
+					}
+					counter := 1
+					for i := 0; i < len(rf.peers); i++ {
+						if i != rf.me && rf.matchIndex[i] >= n {
+							counter++
+						}
+
+						if counter > len(rf.peers)/2 {
+							rf.commitIndex = n
+							rf.channel <- 1
+							DPrintf("==== [%v]: leader start to commit index %v ====", rf.me, rf.commitIndex)
+							break
+						}
+					}
+				}
+			} else if rf.nextIndex[i] > 1 {
+				DPrintf("[%v]: appendEntry not success from peer %v", rf.me, i)
+				rf.nextIndex[i]--
+			}
+		}(i)
+	}
+}
+
 func (rf *Raft) HeartBeats(args *HeartBeatArgs, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -454,87 +535,6 @@ func (rf *Raft) startHeartBeats() {
 			reply := HeartBeatReply{}
 			rf.sendHeartBeats(i, &beatArgs, &reply)
 		}(i, args)
-	}
-}
-
-func (rf *Raft) startAppendEntries(heartBeat bool) {
-	if heartBeat {
-		DPrintf("[%v]: heartbeat", rf.me)
-	} else {
-		DPrintf("[%v]:term %v leader %v start appendEntries", rf.me, rf.currentTerm, rf.me)
-	}
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		go func(i int) {
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			next := rf.nextIndex[i]
-			var args AppendEntriesArgs
-			if next <= 0 {
-				next = 1
-			}
-			args = AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: rf.log[next-1].Index,
-				PrevLogTerm:  rf.log[next-1].Term,
-				Entries:      rf.log[next:],
-				LeaderCommit: rf.lastApplied,
-			}
-
-			reply := AppendEntriesReply{}
-			DPrintf("||| [%v]: appendEntries %v, next is %v, nextIndex %v |||", rf.me, args, next, rf.nextIndex)
-
-			ok := rf.sendAppendEntries(i, &args, &reply)
-			if !ok {
-				return
-			}
-
-			if rf.state != LEADER || rf.currentTerm > reply.Term || rf.currentTerm != args.Term {
-				return
-			}
-
-			if reply.Term > rf.currentTerm {
-				rf.setNewTerm(reply.Term)
-				return
-			}
-
-			if args.Term == rf.currentTerm {
-				if reply.Success {
-					match := args.PrevLogIndex + len(args.Entries)
-					rf.nextIndex[i] = max(match+1, rf.nextIndex[i])
-					rf.matchIndex[i] = max(match, rf.matchIndex[i])
-					DPrintf("[%v]: %v append success next %v, match %v, rf.matchIndex %v, rf.nextIndex %v", rf.me, i, rf.nextIndex[i], rf.matchIndex[i], rf.matchIndex, rf.nextIndex)
-					for n := rf.commitIndex + 1; n <= rf.log[len(rf.log)-1].Index; n++ {
-						DPrintf("###[%v]: term %v, rf.matchIndex %v, counting for index %v  ####", rf.me, rf.currentTerm, rf.matchIndex, n)
-
-						if rf.log[n].Term != rf.currentTerm {
-							DPrintf("[%v]:### Term not match, %v, %v ####", rf.me, rf.log[n].Term, rf.currentTerm)
-							continue
-						}
-						counter := 1
-						for i := 0; i < len(rf.peers); i++ {
-							if i != rf.me && rf.matchIndex[i] >= n {
-								counter++
-							}
-
-							if counter > len(rf.peers)/2 {
-								rf.commitIndex = n
-								rf.channel <- 1
-								DPrintf("==== [%v]: leader start to commit index %v ====", rf.me, rf.commitIndex)
-								break
-							}
-						}
-					}
-				} else if rf.nextIndex[i] > 1 {
-					DPrintf("[%v]: appendEntry not success from peer %v", rf.me, i)
-					rf.nextIndex[i]--
-				}
-			}
-		}(i)
 	}
 }
 
