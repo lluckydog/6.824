@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -27,7 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -108,8 +109,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
@@ -134,6 +140,18 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var voted int
+	var logs []Entry
+	if d.Decode(&term) != nil || d.Decode(&voted) != nil || d.Decode(&logs) != nil {
+		fmt.Errorf("decode error")
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = voted
+		rf.log = logs
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -188,8 +206,12 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term     int
+	Success  bool
+	Conflict bool
+	XTerm    int
+	XIndex   int
+	XLen     int
 }
 
 type HeartBeatArgs struct {
@@ -220,6 +242,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		//rf.setNewTerm(args.Term)
 		rf.votedFor = args.CandidateID
+		rf.persist()
 		DPrintf("[%v]: term %v voted to %v", rf.me, rf.currentTerm, rf.votedFor)
 		rf.resetElectionTimer()
 	} else {
@@ -290,7 +313,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 
 		rf.log = append(rf.log, entry)
-
+		rf.persist()
 		DPrintf("[%v]: term %v Start append entires %v", rf.me, rf.currentTerm, rf.log)
 		rf.startAppendEntries(false)
 	}
@@ -323,6 +346,7 @@ func (rf *Raft) startElection() {
 	rf.state = CANDIDATE
 	rf.votedFor = rf.me
 	rf.resetElectionTimer()
+	rf.persist()
 	votes := 0
 	DPrintf("[%v]: start leader election, term %d\n", rf.me, rf.currentTerm)
 
@@ -358,7 +382,7 @@ func (rf *Raft) startElection() {
 				if *votes >= len(rf.peers)/2 && rf.currentTerm == args.Term && rf.state == CANDIDATE {
 					DPrintf("[%d]:Term %v selected as leader, candidate %v", rf.me, rf.currentTerm, rf.me)
 					rf.state = LEADER
-
+					rf.persist()
 					for i, _ := range rf.peers {
 						nextIndex := len(rf.log)
 
@@ -375,14 +399,15 @@ func (rf *Raft) startElection() {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	DPrintf("[%d]: current term %d, get information from Leader %v, appendEntries %v, prevIndex %v, prevTerm %v, log length %v, LeaderCommit %v, LastApplied %v", rf.me, rf.currentTerm, args.LeaderId, args.Entries, args.PrevLogIndex, args.PrevLogTerm, len(rf.log), args.LeaderCommit, rf.lastApplied)
 	DPrintf("[%d]: current log %v, commitIndex %v", rf.me, rf.log, rf.commitIndex)
 	reply.Success = false
 	reply.Term = rf.currentTerm
+	reply.XTerm = -1
 
 	if args.Term < rf.currentTerm {
 		DPrintf("[%d]: term is smaller than current term, from leader %v, get %v, mine %v,", rf.me, args.LeaderId, args.Term, rf.currentTerm)
-		reply.Term = rf.currentTerm
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -394,15 +419,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.resetElectionTimer()
 	if rf.state == CANDIDATE {
 		rf.state = FOLLOWER
+		rf.persist()
 	}
 
 	lastLogIndex := len(rf.log) - 1
 	if rf.log[lastLogIndex].Index < args.PrevLogIndex {
 		DPrintf("[%d]: Leader %v, last log index is not equal, args %v, myLog %v", rf.me, args.LeaderId, args, rf.log)
+		reply.XLen = len(rf.log)
+		reply.Conflict = true
 		return
 	}
 
 	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.Conflict = true
+		index := args.PrevLogIndex - 1
+		for ; index >= 0; index-- {
+			if rf.log[args.PrevLogIndex].Term != rf.log[index].Term {
+				break
+			}
+		}
+		reply.XIndex = index + 1
+		reply.XLen = len(rf.log)
 		DPrintf("[%d]: log term is not equal , from leader %v, get %v, mine %v, current term %v", rf.me, args.LeaderId, args.PrevLogTerm, rf.log[lastLogIndex].Term, rf.currentTerm)
 		return
 	}
@@ -411,10 +449,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i, entry := range args.Entries {
 		if entry.Index <= rf.log[len(rf.log)-1].Index && rf.log[entry.Index].Term != entry.Term {
 			rf.log = rf.log[:entry.Index]
+			rf.persist()
 		}
 		if entry.Index > rf.log[len(rf.log)-1].Index {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			reply.Term = rf.currentTerm
+			rf.persist()
 			break
 		}
 	}
@@ -481,11 +521,25 @@ func (rf *Raft) leaderAppendEntries(id int, args *AppendEntriesArgs, reply *Appe
 				}
 			}
 		}
-	} else {
+	} else if reply.Conflict {
 		DPrintf("[%v]: appendEntry not success from peer %v", rf.me, id)
-		if rf.nextIndex[id] > 1 {
-			rf.nextIndex[id]--
+		if reply.XTerm != -1 {
+			if rf.log[reply.XIndex].Term != reply.XTerm {
+				rf.nextIndex[id] = reply.XIndex
+			} else {
+				index2 := len(rf.log) - 1
+				for ; index2 >= 0; index2-- {
+					if rf.log[index2].Term == reply.XTerm {
+						break
+					}
+				}
+				rf.nextIndex[id] = index2 + 1
+			}
+		} else {
+			rf.nextIndex[id] = reply.XLen
 		}
+	} else if rf.nextIndex[id] > 1 {
+		rf.nextIndex[id]--
 	}
 }
 
@@ -542,6 +596,7 @@ func (rf *Raft) setNewTerm(term int) {
 	rf.currentTerm = term
 	rf.state = FOLLOWER
 	rf.votedFor = -1
+	rf.persist()
 }
 
 func (rf *Raft) startHeartBeats() {
