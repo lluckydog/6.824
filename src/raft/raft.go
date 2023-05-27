@@ -388,9 +388,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		//rf.setNewTerm(args.Term)
 		rf.votedFor = args.CandidateID
+		rf.resetElectionTimer()
 		rf.persist()
 		DPrintf("[%v]: term %v voted to %v, args %v, log %v", rf.me, rf.currentTerm, rf.votedFor, *args, rf.log)
-		rf.resetElectionTimer()
+
 	} else {
 		reply.VoteGranted = false
 	}
@@ -567,15 +568,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	}
-	base := rf.log[0].Index
 
 	rf.resetElectionTimer()
+
 	if rf.state == CANDIDATE {
 		rf.state = FOLLOWER
 		reply.XIndex = rf.lastApplied + 1
 		rf.persist()
 	}
-
+	base := rf.log[0].Index
 	lastLogIndex := len(rf.log) - 1
 	if rf.log[lastLogIndex].Index < args.PrevLogIndex {
 		DPrintf("[%d]: Leader %v, last log index is not equal, args %v, myLog %v", rf.me, args.LeaderId, args, rf.log)
